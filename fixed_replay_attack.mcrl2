@@ -1,0 +1,344 @@
+% ===============================================================================
+% xTEE ESS - DMA HANDOVER WINDOW REPLAY ATTACK MODEL (SECURE VERSION)
+% ===============================================================================
+% 
+% COUNTERMEASURES: Replay detection system with critical operations blocking
+
+sort
+    BlockID = struct block0 | block1 | block2 | block3 | invalid_block;
+    SecurityDomain = struct secure | nonsecure | attacker_privileged;
+    BlockState = struct encrypted_flash | being_validated | in_ess | in_efbc | executing | compromised;
+    AccessPattern = struct sequential | looping | random;
+    DMAChannel = struct channel1 | channel2;
+    DMAState = struct dma_idle | dma_transferring | dma_compromised | dma_handover;
+    MemoryRegion = struct flash | ess | efbc | validator;
+    DMAProgress = struct progress0 | progress1 | progress2;
+    ValidationResult = struct valid | invalid | not_validated | replayed;
+    BlockList = List(BlockID);
+    AccessCount = Nat;
+    AttackState = struct attack_idle | attack_monitoring | attack_injecting | attack_success | attack_blocked;
+    SecurityState = struct security_normal | security_compromised | security_lockdown;
+
+map
+    contains: BlockID # BlockList -> Bool;
+    remove_block: BlockID # BlockList -> BlockList;
+    add_block: BlockID # BlockList -> BlockList;
+    list_size: BlockList -> Nat;
+    has_dma_conflict: MemoryRegion # MemoryRegion -> Bool;
+    next_block: BlockID # AccessPattern -> BlockID;
+    allowed_operation: SecurityDomain # MemoryRegion -> Bool;
+    is_vulnerable_handover: DMAChannel # DMAChannel -> Bool;
+    is_security_compromised: SecurityState -> Bool;
+
+var
+    b, b1, b2: BlockID;
+    l: BlockList;
+    r1, r2: MemoryRegion;
+    p: AccessPattern;
+    d: SecurityDomain;
+    ch1, ch2: DMAChannel;
+    sec_state: SecurityState;
+
+eqn
+    contains(b, []) = false;
+    contains(b, b1 |> l) = (b == b1) || contains(b, l);
+    
+    remove_block(b, []) = [];
+    remove_block(b, b1 |> l) = if(b == b1, l, b1 |> remove_block(b, l));
+    
+    add_block(b, l) = if(list_size(l) < 2 && !contains(b, l), b |> l, l);
+    
+    list_size([]) = 0;
+    list_size(b |> l) = 1 + list_size(l);
+    
+    has_dma_conflict(ess, ess) = true;
+    has_dma_conflict(efbc, efbc) = true;
+    has_dma_conflict(ess, efbc) = true;
+    has_dma_conflict(efbc, ess) = true;
+    has_dma_conflict(r1, r2) = false;
+    
+    next_block(block0, sequential) = block1;
+    next_block(block1, sequential) = block2;
+    next_block(block2, sequential) = block3;
+    next_block(block3, sequential) = block0;
+    
+    allowed_operation(secure, r1) = true;
+    allowed_operation(nonsecure, flash) = true;
+    allowed_operation(nonsecure, ess) = false;
+    allowed_operation(nonsecure, efbc) = false;
+    allowed_operation(attacker_privileged, flash) = true;
+    allowed_operation(attacker_privileged, ess) = true;
+    allowed_operation(attacker_privileged, efbc) = true;
+    
+    is_vulnerable_handover(channel1, channel2) = true;
+    is_vulnerable_handover(channel2, channel1) = true;
+    is_vulnerable_handover(ch1, ch1) = false;
+    
+    is_security_compromised(security_compromised) = true;
+    is_security_compromised(security_lockdown) = true;
+    is_security_compromised(security_normal) = false;
+
+act
+    execute_instruction: BlockID # SecurityDomain;
+    memfault: BlockID;
+    ess_load: BlockID;
+    efbc_load: BlockID;
+    validate_start: BlockID # SecurityDomain;
+    validate_complete: BlockID # ValidationResult;
+    dma_request: DMAChannel # BlockID # MemoryRegion # MemoryRegion;
+    dma_progress: DMAChannel # DMAProgress;
+    dma_complete: DMAChannel # BlockID;
+    security_violation: SecurityDomain # MemoryRegion;
+    
+    attacker_monitor_dma: DMAChannel;
+    attacker_inject_command: DMAChannel # BlockID;
+    attacker_read_obsolete_efb: BlockID;
+    attacker_attempt_replay: BlockID # ValidationResult;
+    dma_handover_start: DMAChannel # DMAChannel;
+    dma_handover_complete: DMAChannel # DMAChannel;
+    dma_race_condition_detected;
+    attack_successful: BlockID;
+    host_os_compromised;
+    
+    replay_attack_detected;
+    security_monitor_activate;
+    security_lockdown_engaged;
+    dma_operations_blocked;
+    replay_operations_blocked;
+    attack_prevented;
+    
+    
+    send_validation_request: BlockID # SecurityDomain;
+    receive_validation_request: BlockID # SecurityDomain;
+    send_validation_result: BlockID # ValidationResult;
+    receive_validation_result: BlockID # ValidationResult;
+    sync_validation_request: BlockID # SecurityDomain;
+    sync_validation_result: BlockID # ValidationResult;
+
+    send_dma_attack_request: DMAChannel # BlockID;
+    receive_dma_attack_request: DMAChannel # BlockID;
+    send_attack_result: BlockID # ValidationResult;
+    receive_attack_result: BlockID # ValidationResult;
+    sync_dma_attack_request: DMAChannel # BlockID;
+    sync_attack_result: BlockID # ValidationResult;
+    
+    send_handover_signal: DMAChannel # DMAChannel;
+    receive_handover_signal: DMAChannel # DMAChannel;
+    sync_handover_signal: DMAChannel # DMAChannel;
+    
+    send_security_alert;
+    receive_security_alert;
+    sync_security_alert;
+
+proc
+    xTEESystemWithAttacker = 
+        EnclaveExecutor(block0, [], [], secure, sequential, 0, 0, 0, 0, security_normal)
+        || ESSManager([], not_validated, not_validated, not_validated, not_validated)
+        || CompromisedDMAController(dma_idle, invalid_block, progress0, dma_idle, invalid_block, progress0, security_normal)
+        || ValidationEngine(invalid_block, secure, security_normal)
+        || PrivilegedAttacker(attack_idle, [], [])
+        || SecurityMonitor(security_normal);
+
+    SecurityMonitor(sec_state: SecurityState) =
+        receive_security_alert .
+        replay_attack_detected .
+        security_monitor_activate .
+        security_lockdown_engaged .
+        SecurityMonitor(security_lockdown)
+        +
+        (sec_state == security_lockdown) ->
+            dma_operations_blocked .
+            replay_operations_blocked .
+            attack_prevented .
+            SecurityMonitor(sec_state);
+
+    PrivilegedAttacker(state: AttackState, monitored_blocks: BlockList, 
+                      obsolete_blocks: BlockList) =
+        
+        (state == attack_idle) ->
+            sum ch: DMAChannel . 
+                attacker_monitor_dma(ch) .
+                PrivilegedAttacker(attack_monitoring, monitored_blocks, obsolete_blocks)
+        +
+        (state == attack_monitoring) ->
+            sum b: BlockID . 
+                attacker_read_obsolete_efb(b) .
+                send_security_alert .  
+                PrivilegedAttacker(attack_blocked, monitored_blocks, 
+                                 add_block(b, obsolete_blocks))  
+        +
+        (state == attack_monitoring && list_size(obsolete_blocks) > 0) ->
+            sum ch1, ch2: DMAChannel, b: BlockID . 
+                (is_vulnerable_handover(ch1, ch2) && contains(b, obsolete_blocks)) ->
+                    dma_race_condition_detected .
+                    send_handover_signal(ch1, ch2) .
+                    send_dma_attack_request(ch1, b) .
+                    PrivilegedAttacker(attack_injecting, monitored_blocks, obsolete_blocks)
+        +
+        (state == attack_injecting) ->
+            sum b: BlockID, result: ValidationResult . 
+                (contains(b, obsolete_blocks)) ->
+                    receive_attack_result(b, result) .
+                    (result == replayed) ->
+                        attacker_attempt_replay(b, result) .
+                        attack_successful(b) .
+                        PrivilegedAttacker(attack_success, monitored_blocks, obsolete_blocks)
+        +
+        (state == attack_blocked) ->
+            attack_prevented .
+            PrivilegedAttacker(attack_blocked, monitored_blocks, obsolete_blocks);
+
+    CompromisedDMAController(ch1_state: DMAState, ch1_block: BlockID, ch1_progress: DMAProgress,
+                           ch2_state: DMAState, ch2_block: BlockID, ch2_progress: DMAProgress,
+                           sec_state: SecurityState) =
+        
+        receive_security_alert .
+        CompromisedDMAController(ch1_state, ch1_block, ch1_progress,
+                               ch2_state, ch2_block, ch2_progress, security_lockdown)
+        +
+        (is_security_compromised(sec_state)) ->
+            dma_operations_blocked .
+            CompromisedDMAController(ch1_state, ch1_block, ch1_progress,
+                                   ch2_state, ch2_block, ch2_progress, sec_state)
+        +
+        (!is_security_compromised(sec_state)) ->
+            sum b: BlockID . 
+                (ch1_state == dma_idle) ->
+                    dma_request(channel1, b, ess, efbc) .
+                    CompromisedDMAController(dma_transferring, b, progress0,
+                                           ch2_state, ch2_block, ch2_progress, sec_state)
+        +
+        (!is_security_compromised(sec_state) && ch1_state == dma_transferring && ch1_progress == progress0) ->
+            dma_progress(channel1, progress1) .
+            CompromisedDMAController(dma_transferring, ch1_block, progress1,
+                                    ch2_state, ch2_block, ch2_progress, sec_state)
+        +
+        (!is_security_compromised(sec_state) && ch1_state == dma_transferring && ch1_progress == progress1) ->
+            dma_progress(channel1, progress2) .
+            CompromisedDMAController(dma_transferring, ch1_block, progress2,
+                                    ch2_state, ch2_block, ch2_progress, sec_state)
+        +
+        (!is_security_compromised(sec_state) && ch1_state == dma_transferring && ch1_progress == progress2) ->
+            dma_complete(channel1, ch1_block) .
+            efbc_load(ch1_block) .
+            CompromisedDMAController(dma_idle, invalid_block, progress0,
+                                    ch2_state, ch2_block, ch2_progress, sec_state)
+        +
+        (!is_security_compromised(sec_state)) ->
+            sum ch_from, ch_to: DMAChannel . 
+                receive_handover_signal(ch_from, ch_to) .
+                dma_handover_start(ch_from, ch_to) .
+                CompromisedDMAController(dma_handover, ch1_block, ch1_progress,
+                                       dma_handover, ch2_block, ch2_progress, sec_state)
+        +
+        (!is_security_compromised(sec_state)) ->
+            sum ch: DMAChannel, b: BlockID . 
+                ((ch1_state == dma_handover || ch2_state == dma_handover)) ->
+                    receive_dma_attack_request(ch, b) .
+                    attacker_inject_command(ch, b) .
+                    (
+                        (ch == channel1) ->
+                            send_attack_result(b, replayed) .
+                            CompromisedDMAController(dma_compromised, b, progress0,
+                                                   ch2_state, ch2_block, ch2_progress, sec_state)
+                        +
+                        (ch == channel2) ->
+                            send_attack_result(b, replayed) .
+                            CompromisedDMAController(ch1_state, ch1_block, ch1_progress,
+                                                   dma_compromised, b, progress0, sec_state)
+                    )
+        +
+        (!is_security_compromised(sec_state) && (ch1_state == dma_handover || ch2_state == dma_handover)) ->
+            dma_handover_complete(channel1, channel2) .
+            CompromisedDMAController(dma_idle, invalid_block, progress0,
+                                   dma_idle, invalid_block, progress0, sec_state);
+
+    EnclaveExecutor(current: BlockID, efbc_list: BlockList, ess_list: BlockList, 
+                    domain: SecurityDomain, pattern: AccessPattern,
+                    cnt0: AccessCount, cnt1: AccessCount, 
+                    cnt2: AccessCount, cnt3: AccessCount,
+                    sec_state: SecurityState) =
+        
+        receive_security_alert .
+        EnclaveExecutor(current, efbc_list, ess_list, domain, pattern,
+                       cnt0, cnt1, cnt2, cnt3, security_lockdown)
+        +
+        (is_security_compromised(sec_state)) ->
+            replay_operations_blocked .
+            EnclaveExecutor(current, efbc_list, ess_list, domain, pattern,
+                           cnt0, cnt1, cnt2, cnt3, sec_state)
+        +
+        (!is_security_compromised(sec_state) && contains(current, efbc_list) && domain == secure) ->
+            execute_instruction(current, domain) .
+            EnclaveExecutor(next_block(current, pattern), efbc_list, ess_list, domain,
+                          pattern, cnt0, cnt1, cnt2, cnt3, sec_state)
+        +
+        (!is_security_compromised(sec_state) && !contains(current, efbc_list) && domain == secure) ->
+            memfault(current) .
+            send_validation_request(current, domain) .
+            receive_validation_result(current, valid) .
+            EnclaveExecutor(current, add_block(current, efbc_list), ess_list, domain,
+                          pattern, cnt0, cnt1, cnt2, cnt3, sec_state)
+        +
+        (!is_security_compromised(sec_state) && domain == attacker_privileged) ->
+            attack_successful(current) .
+            delta;
+
+    ESSManager(ess_blocks: BlockList, val0: ValidationResult, val1: ValidationResult,
+               val2: ValidationResult, val3: ValidationResult) =
+        
+        sum b: BlockID . 
+            (list_size(ess_blocks) < 2) ->
+                ess_load(b) .
+                ESSManager(add_block(b, ess_blocks), val0, val1, val2, val3);
+
+    ValidationEngine(validating: BlockID, domain: SecurityDomain, sec_state: SecurityState) =
+        
+        receive_security_alert .
+        ValidationEngine(validating, domain, security_lockdown)
+        +
+        (is_security_compromised(sec_state)) ->
+            replay_operations_blocked .
+            ValidationEngine(validating, domain, sec_state)
+        +
+        (!is_security_compromised(sec_state)) ->
+            sum b: BlockID, d: SecurityDomain . 
+                (validating == invalid_block) ->
+                    receive_validation_request(b, d) .
+                    validate_start(b, d) .
+                    ValidationEngine(b, d, sec_state)
+        +
+        (!is_security_compromised(sec_state) && validating != invalid_block && domain == secure) ->
+            validate_complete(validating, valid) .
+            send_validation_result(validating, valid) .
+            ValidationEngine(invalid_block, domain, sec_state)
+        +
+        (!is_security_compromised(sec_state) && validating != invalid_block && domain == attacker_privileged) ->
+            validate_complete(validating, replayed) .
+            send_validation_result(validating, replayed) .
+            ValidationEngine(invalid_block, domain, sec_state);
+
+init
+    allow({
+        execute_instruction, memfault, ess_load, efbc_load,
+        validate_start, validate_complete, dma_request, dma_progress, dma_complete,
+        security_violation, attacker_monitor_dma, attacker_inject_command,
+        attacker_read_obsolete_efb, attacker_attempt_replay, 
+        dma_handover_start, dma_handover_complete, dma_race_condition_detected,
+        attack_successful, host_os_compromised, replay_attack_detected,
+        security_monitor_activate, security_lockdown_engaged, dma_operations_blocked,
+        replay_operations_blocked, attack_prevented,
+        sync_validation_request, sync_validation_result,
+        sync_dma_attack_request, sync_attack_result, sync_handover_signal, sync_security_alert
+    },
+    comm({
+        send_validation_request | receive_validation_request -> sync_validation_request,
+        send_validation_result | receive_validation_result -> sync_validation_result,
+        send_dma_attack_request | receive_dma_attack_request -> sync_dma_attack_request,
+        send_attack_result | receive_attack_result -> sync_attack_result,
+        send_handover_signal | receive_handover_signal -> sync_handover_signal,
+        send_security_alert | receive_security_alert -> sync_security_alert
+    },
+        xTEESystemWithAttacker
+    )
+);

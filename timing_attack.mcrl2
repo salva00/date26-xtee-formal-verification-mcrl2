@@ -1,0 +1,310 @@
+% ===============================================================================
+% xTEE ESS - CONTEXT SWITCH TIMING ATTACK MODEL
+% ===============================================================================
+% 
+% THREAT MODEL: Context Switch Dependency -> Timing Attack
+% ATTACKER: Compromised Host OS
+% VULNERABILITY: TEE isolation is compromised through timing analysis
+% 
+% ATTACK SCENARIO:
+% 1. The attacker saturates the timers used for context switching from xTEE
+% 2. MemFault is generated due to saturation
+% 3. The attacker requests timers to redo validation
+% 4. The delay in validation is observed
+% 5. The attacker manages to understand which EFB is being requested
+
+sort
+    BlockID = struct block0 | block1 | block2 | block3 | invalid_block;
+    SecurityDomain = struct secure | nonsecure | compromised_host;
+    BlockState = struct encrypted_flash | being_validated | in_ess | in_efbc | executing;
+    AccessPattern = struct sequential | looping | random | manipulated;
+    DMAChannel = struct channel1 | channel2;
+    DMAState = struct dma_idle | dma_transferring;
+    MemoryRegion = struct flash | ess | efbc | validator;
+    DMAProgress = struct progress0 | progress1 | progress2;
+    ValidationResult = struct valid | invalid | not_validated;
+    BlockList = List(BlockID);
+    AccessCount = Nat;
+    TimerState = struct timer_idle | timer_saturated | timer_measuring;
+    AttackPhase = struct phase_idle | phase_saturating | phase_triggering | phase_measuring | phase_success;
+    TimingMeasurement = Nat;
+
+map
+    contains: BlockID # BlockList -> Bool;
+    remove_block: BlockID # BlockList -> BlockList;
+    add_block: BlockID # BlockList -> BlockList;
+    list_size: BlockList -> Nat;
+    has_dma_conflict: MemoryRegion # MemoryRegion -> Bool;
+    next_block: BlockID # AccessPattern -> BlockID;
+    allowed_operation: SecurityDomain # MemoryRegion -> Bool;
+    is_timer_saturated: TimerState -> Bool;
+    extract_timing_info: BlockID # TimingMeasurement -> BlockID;
+    manipulate_access_pattern: AccessPattern -> AccessPattern;
+
+var
+    b, b1, b2: BlockID;
+    l: BlockList;
+    r1, r2: MemoryRegion;
+    p: AccessPattern;
+    d: SecurityDomain;
+    t: TimerState;
+    timing: TimingMeasurement;
+
+eqn
+    contains(b, []) = false;
+    contains(b, b1 |> l) = (b == b1) || contains(b, l);
+    
+    remove_block(b, []) = [];
+    remove_block(b, b1 |> l) = if(b == b1, l, b1 |> remove_block(b, l));
+    
+    add_block(b, l) = if(list_size(l) < 2 && !contains(b, l), b |> l, l);
+    
+    list_size([]) = 0;
+    list_size(b |> l) = 1 + list_size(l);
+    
+    has_dma_conflict(ess, ess) = true;
+    has_dma_conflict(efbc, efbc) = true;
+    has_dma_conflict(ess, efbc) = true;
+    has_dma_conflict(efbc, ess) = true;
+    has_dma_conflict(r1, r2) = false;
+    
+    next_block(block0, sequential) = block1;
+    next_block(block1, sequential) = block2;
+    next_block(block2, sequential) = block3;
+    next_block(block3, sequential) = block0;
+    
+    next_block(b, manipulated) = block0; 
+    
+    allowed_operation(secure, r1) = true;
+    allowed_operation(nonsecure, flash) = true;
+    allowed_operation(nonsecure, ess) = false;
+    allowed_operation(nonsecure, efbc) = false;
+    allowed_operation(compromised_host, flash) = true;
+    allowed_operation(compromised_host, ess) = false;
+    allowed_operation(compromised_host, efbc) = false;
+    
+    is_timer_saturated(timer_saturated) = true;
+    is_timer_saturated(timer_idle) = false;
+    is_timer_saturated(timer_measuring) = false;
+    
+    extract_timing_info(block0, timing) = if(timing > 2, block0, invalid_block);
+    extract_timing_info(block1, timing) = if(timing > 3, block1, invalid_block);
+    extract_timing_info(block2, timing) = if(timing > 4, block2, invalid_block);
+    extract_timing_info(block3, timing) = if(timing > 5, block3, invalid_block);
+    extract_timing_info(invalid_block, timing) = invalid_block; 
+
+    manipulate_access_pattern(sequential) = manipulated;
+    manipulate_access_pattern(looping) = manipulated;
+    manipulate_access_pattern(random) = manipulated;
+    manipulate_access_pattern(manipulated) = manipulated;
+
+act
+    execute_instruction: BlockID # SecurityDomain;
+    memfault: BlockID;
+    ess_load: BlockID;
+    efbc_load: BlockID;
+    validate_start: BlockID # SecurityDomain;
+    validate_complete: BlockID # ValidationResult;
+    dma_request: DMAChannel # BlockID # MemoryRegion # MemoryRegion;
+    dma_progress: DMAChannel # DMAProgress;
+    dma_complete: DMAChannel # BlockID;
+    security_violation: SecurityDomain # MemoryRegion;
+    
+    attacker_saturate_timer;
+    attacker_manipulate_pattern: AccessPattern;
+    attacker_trigger_memfault: BlockID;
+    attacker_request_timer_validation;
+    attacker_measure_timing: TimingMeasurement;
+    attacker_analyze_timing: BlockID # TimingMeasurement;
+    context_switch_delayed;
+    timer_contention_detected;
+    timing_side_channel_leak: BlockID;
+    attack_infer_efb: BlockID;
+    host_os_compromise_detected;
+    
+    send_validation_request: BlockID # SecurityDomain;
+    receive_validation_request: BlockID # SecurityDomain;
+    send_validation_result: BlockID # ValidationResult;
+    receive_validation_result: BlockID # ValidationResult;
+    sync_validation_request: BlockID # SecurityDomain;
+    sync_validation_result: BlockID # ValidationResult;
+
+    send_timer_saturation_signal;
+    receive_timer_saturation_signal;
+    send_pattern_manipulation: AccessPattern;
+    receive_pattern_manipulation: AccessPattern;
+    send_memfault_trigger: BlockID;
+    receive_memfault_trigger: BlockID;
+    send_timing_measurement: BlockID # TimingMeasurement;
+    receive_timing_measurement: BlockID # TimingMeasurement;
+    sync_timer_saturation_signal;
+    sync_pattern_manipulation: AccessPattern;
+    sync_memfault_trigger: BlockID;
+    sync_timing_measurement: BlockID # TimingMeasurement;
+
+proc
+    xTEESystemWithTimingAttack = 
+        CompromisedEnclaveExecutor(block0, [], [], secure, sequential, 0, 0, 0, 0)
+        || ESSManager([], not_validated, not_validated, not_validated, not_validated)
+        || DMAController(dma_idle, invalid_block, progress0, dma_idle, invalid_block, progress0)
+        || TimingSensitiveValidator(invalid_block, secure, timer_idle)
+        || CompromisedHostOS(phase_idle, [], timer_idle, 0);
+
+    
+    
+    CompromisedHostOS(phase: AttackPhase, observed_blocks: BlockList, 
+                     timer_state: TimerState, measurements: TimingMeasurement) =
+        
+        (phase == phase_idle) ->
+            host_os_compromise_detected .
+            attacker_saturate_timer .
+            send_timer_saturation_signal .
+            CompromisedHostOS(phase_saturating, observed_blocks, timer_saturated, measurements)
+        +
+        (phase == phase_saturating) ->
+            sum p: AccessPattern . 
+                attacker_manipulate_pattern(manipulate_access_pattern(p)) .
+                send_pattern_manipulation(manipulate_access_pattern(p)) .
+                CompromisedHostOS(phase_triggering, observed_blocks, timer_saturated, measurements)
+        +
+        (phase == phase_triggering) ->
+            sum b: BlockID . 
+                (b != invalid_block) ->
+                    attacker_trigger_memfault(b) .
+                    send_memfault_trigger(b) . 
+                    timer_contention_detected .
+                    CompromisedHostOS(phase_measuring, add_block(b, observed_blocks), timer_state, measurements)
+        +
+        (phase == phase_measuring && is_timer_saturated(timer_state)) ->
+            attacker_request_timer_validation .
+            sum b: BlockID, timing: TimingMeasurement . 
+                (timing > 0 && timing <= 6 && contains(b, observed_blocks)) ->
+                    receive_timing_measurement(b, timing) .
+                    attacker_measure_timing(timing) .
+                    CompromisedHostOS(phase_measuring, observed_blocks, timer_measuring, timing)
+        +
+        (phase == phase_measuring && timer_state == timer_measuring && measurements > 0) ->
+            sum b: BlockID . 
+                (contains(b, observed_blocks) && b != invalid_block) ->
+                    attacker_analyze_timing(b, measurements) .
+                    ((b == block0 && measurements > 2) ||
+                     (b == block1 && measurements > 3) ||
+                     (b == block2 && measurements > 4) ||
+                     (b == block3 && measurements > 5)) ->
+                        timing_side_channel_leak(b) .
+                        attack_infer_efb(b) .
+                        CompromisedHostOS(phase_success, observed_blocks, timer_state, measurements);
+
+    CompromisedEnclaveExecutor(current: BlockID, efbc_list: BlockList, ess_list: BlockList, 
+                              domain: SecurityDomain, pattern: AccessPattern,
+                              cnt0: AccessCount, cnt1: AccessCount, 
+                              cnt2: AccessCount, cnt3: AccessCount) =
+        
+    sum new_pattern: AccessPattern . 
+        receive_pattern_manipulation(new_pattern) .
+        CompromisedEnclaveExecutor(current, efbc_list, ess_list, domain, new_pattern,
+                                 cnt0, cnt1, cnt2, cnt3)
+    +
+    sum trigger_block: BlockID . 
+        receive_memfault_trigger(trigger_block) .
+        memfault(trigger_block) .
+        context_switch_delayed .
+        send_validation_request(trigger_block, domain) .
+        receive_validation_result(trigger_block, valid) .
+        CompromisedEnclaveExecutor(trigger_block, add_block(trigger_block, efbc_list), ess_list, domain,
+                                 pattern, cnt0, cnt1, cnt2, cnt3)
+    +
+    (contains(current, efbc_list) && domain == secure) ->
+        execute_instruction(current, domain) .
+        CompromisedEnclaveExecutor(next_block(current, pattern), efbc_list, ess_list, domain,
+                                 pattern, cnt0, cnt1, cnt2, cnt3)
+    +
+    (!contains(current, efbc_list) && domain == secure) ->
+        memfault(current) .
+        send_validation_request(current, domain) .
+        receive_validation_result(current, valid) .
+        CompromisedEnclaveExecutor(current, add_block(current, efbc_list), ess_list, domain,
+                                 pattern, cnt0, cnt1, cnt2, cnt3);
+    TimingSensitiveValidator(validating: BlockID, domain: SecurityDomain, 
+                            timer_state: TimerState) =
+        receive_timer_saturation_signal .
+        TimingSensitiveValidator(validating, domain, timer_saturated)
+        +
+        sum b: BlockID, d: SecurityDomain . 
+            (validating == invalid_block) ->
+                receive_validation_request(b, d) .
+                validate_start(b, d) .
+                TimingSensitiveValidator(b, d, timer_state)
+        +
+        (validating != invalid_block && domain == secure && !is_timer_saturated(timer_state)) ->
+            validate_complete(validating, valid) .
+            send_validation_result(validating, valid) .
+            TimingSensitiveValidator(invalid_block, domain, timer_state)
+        +
+        (validating != invalid_block && domain == secure && is_timer_saturated(timer_state)) ->
+            context_switch_delayed .
+            validate_complete(validating, valid) .
+            timing_side_channel_leak(validating) .
+             sum timing: TimingMeasurement . 
+                (timing > 0 && timing <= 6) ->
+                    send_timing_measurement(validating, timing) . 
+                    send_validation_result(validating, valid) .
+                    TimingSensitiveValidator(invalid_block, domain, timer_idle);
+
+    ESSManager(ess_blocks: BlockList, val0: ValidationResult, val1: ValidationResult,
+               val2: ValidationResult, val3: ValidationResult) =
+        
+        sum b: BlockID . 
+            (list_size(ess_blocks) < 2) ->
+                ess_load(b) .
+                ESSManager(add_block(b, ess_blocks), val0, val1, val2, val3);
+
+    DMAController(ch1_state: DMAState, ch1_block: BlockID, ch1_progress: DMAProgress,
+                  ch2_state: DMAState, ch2_block: BlockID, ch2_progress: DMAProgress) =
+        
+        sum b: BlockID . 
+            (ch1_state == dma_idle) ->
+                dma_request(channel1, b, ess, efbc) .
+                DMAController(dma_transferring, b, progress0,
+                            ch2_state, ch2_block, ch2_progress)
+        +
+(ch1_state == dma_transferring && ch1_progress == progress0) ->
+    dma_progress(channel1, progress1) .
+    DMAController(dma_transferring, ch1_block, progress1,
+                ch2_state, ch2_block, ch2_progress)
++
+(ch1_state == dma_transferring && ch1_progress == progress1) ->
+    dma_progress(channel1, progress2) .
+    DMAController(dma_transferring, ch1_block, progress2,
+                ch2_state, ch2_block, ch2_progress)
+        +
+        (ch1_state == dma_transferring && ch1_progress == progress2) ->
+            dma_complete(channel1, ch1_block) .
+            efbc_load(ch1_block) .
+            DMAController(dma_idle, invalid_block, progress0,
+                        ch2_state, ch2_block, ch2_progress);
+
+init
+    allow({
+        execute_instruction, memfault, ess_load, efbc_load,
+        validate_start, validate_complete, dma_request, dma_progress, dma_complete,
+        security_violation, attacker_saturate_timer, attacker_manipulate_pattern,
+        attacker_trigger_memfault, attacker_request_timer_validation,
+        attacker_measure_timing, attacker_analyze_timing, context_switch_delayed,
+        timer_contention_detected, timing_side_channel_leak, attack_infer_efb,
+        host_os_compromise_detected,
+        sync_validation_request, sync_validation_result,
+        sync_timer_saturation_signal, sync_pattern_manipulation,
+        sync_memfault_trigger, sync_timing_measurement
+    },
+    comm({
+        send_validation_request | receive_validation_request -> sync_validation_request,
+        send_validation_result | receive_validation_result -> sync_validation_result,
+        send_timer_saturation_signal | receive_timer_saturation_signal -> sync_timer_saturation_signal,
+        send_pattern_manipulation | receive_pattern_manipulation -> sync_pattern_manipulation,
+        send_memfault_trigger | receive_memfault_trigger -> sync_memfault_trigger,
+        send_timing_measurement | receive_timing_measurement -> sync_timing_measurement
+    },
+        xTEESystemWithTimingAttack
+    )
+);
