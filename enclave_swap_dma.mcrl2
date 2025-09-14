@@ -1,0 +1,453 @@
+% ===============================================================================
+% xTEE Enclave Swap Formal Model
+% ===============================================================================
+% 
+% MAIN MODEL ASSUMPTIONS:
+% 1. Number of EFB reduced to 4 blocks 
+% 2. EFBC can contain max 2 blocks
+% 3. ESS can contain max 2 blocks (validated cache)
+% 4. Single enclave in execution
+% 5. HMAC validation abstracted as atomic operation
+% 6. 2-channel DMA with discretized timing (0,1,2)
+% 7. No explicit SAU/MPU modeling (abstracted as secure/nonsecure domains)
+% 8. Access patterns limited to 3 types (sequential, looping, random)
+% 9. Abstracted cryptography (we don't model keys or algorithms)
+% 10. Abstract infinite memory (no explicit address management)
+
+
+%           echo '[true*] nu X. ([true] X && [validate_start(block0, nonsecure)] false)' | lts2pbes --formula=/dev/stdin enclave_swap_dma.lts | pbes2bool
+%           true
+%           1h 29m 26s 
+
+%           echo 'mu X. (<validate_start(block0, nonsecure)> true || <true> X)' | lts2pbes --formula=/dev/stdin enclave_swap_dma.lts | pbes2bool
+%           false
+%           15m 42s
+
+% -------------------------------------------------------------------------------
+% Data Types
+% -------------------------------------------------------------------------------
+sort
+    BlockID = struct block0 | block1 | block2 | block3 | invalid_block;
+
+    SecurityDomain = struct secure | nonsecure;
+
+    BlockState = struct 
+        encrypted_flash |
+        being_validated |
+        in_ess |  
+        in_efbc |
+        executing; 
+
+    AccessPattern = struct
+        sequential |
+        looping |
+        random;
+
+    DMAChannel = struct channel1 | channel2;
+
+
+    DMAState = struct
+        dma_idle |
+        dma_transferring;
+
+    MemoryRegion = struct flash | ess | efbc | validator;
+
+    DMAProgress = struct progress0 | progress1 | progress2;
+
+    ValidationResult = struct valid | invalid | not_validated;
+
+    BlockList = List(BlockID);
+
+    AccessCount = Nat;
+
+% -------------------------------------------------------------------------------
+% Functions
+% -------------------------------------------------------------------------------
+map
+    contains: BlockID # BlockList -> Bool;
+
+    remove_block: BlockID # BlockList -> BlockList;
+
+    add_block: BlockID # BlockList -> BlockList;
+
+    list_size: BlockList -> Nat;
+
+    select_lfu: BlockList # AccessCount # AccessCount # AccessCount # AccessCount -> BlockID;
+
+    has_dma_conflict: MemoryRegion # MemoryRegion -> Bool;
+
+    next_block: BlockID # AccessPattern -> BlockID;
+
+    allowed_operation: SecurityDomain # MemoryRegion -> Bool;
+
+var
+    b, b1, b2: BlockID;
+    l: BlockList;
+    r1, r2: MemoryRegion;
+    p: AccessPattern;
+    d: SecurityDomain;
+    c0, c1, c2, c3: AccessCount;
+
+eqn
+
+    contains(b, []) = false;
+
+    contains(b, b1 |> l) = (b == b1) || contains(b, l);
+
+    remove_block(b, []) = [];
+    remove_block(b, b1 |> l) = if(b == b1, l, b1 |> remove_block(b, l));
+
+    add_block(b, l) = if(list_size(l) < 2 && !contains(b, l), b |> l, l);
+
+    list_size([]) = 0;
+    list_size(b |> l) = 1 + list_size(l);
+
+    select_lfu([block0, block1], c0, c1, c2, c3) = if(c0 <= c1, block0, block1);
+    select_lfu([block0, block2], c0, c1, c2, c3) = if(c0 <= c2, block0, block2);
+    select_lfu([block0, block3], c0, c1, c2, c3) = if(c0 <= c3, block0, block3);
+    select_lfu([block1, block2], c0, c1, c2, c3) = if(c1 <= c2, block1, block2);
+    select_lfu([block1, block3], c0, c1, c2, c3) = if(c1 <= c3, block1, block3);
+    select_lfu([block2, block3], c0, c1, c2, c3) = if(c2 <= c3, block2, block3);
+    select_lfu([b], c0, c1, c2, c3) = b;
+    select_lfu([], c0, c1, c2, c3) = invalid_block;
+
+    has_dma_conflict(ess, ess) = true;
+    has_dma_conflict(efbc, efbc) = true;
+    has_dma_conflict(ess, efbc) = true;
+    has_dma_conflict(efbc, ess) = true;
+    
+    has_dma_conflict(flash, r2) = false;
+    has_dma_conflict(r1, flash) = false;
+    has_dma_conflict(validator, validator) = true;
+    has_dma_conflict(r1, r2) = false;
+
+    next_block(block0, sequential) = block1;
+    next_block(block1, sequential) = block2;
+    next_block(block2, sequential) = block3;
+    next_block(block3, sequential) = block0;
+
+    next_block(block0, looping) = block1;
+    next_block(block1, looping) = block0;
+    next_block(block2, looping) = block0; 
+    next_block(block3, looping) = block0;
+
+    allowed_operation(secure, r1) = true;
+
+    allowed_operation(nonsecure, flash) = true;
+    allowed_operation(nonsecure, ess) = false;
+    allowed_operation(nonsecure, efbc) = false;
+    allowed_operation(nonsecure, validator) = false;
+
+% -------------------------------------------------------------------------------
+% Actions
+% -------------------------------------------------------------------------------
+act
+    execute_instruction: BlockID # SecurityDomain;
+
+    memfault: BlockID;
+
+    idle_wait: SecurityDomain;
+
+    ess_check: BlockID # Bool;
+
+    ess_load: BlockID;
+    
+    ess_evict: BlockID;
+
+    efbc_load: BlockID;
+
+    efbc_evict: BlockID;   
+
+    validate_start: BlockID # SecurityDomain;
+    validate_complete: BlockID # ValidationResult;
+
+    dma_request: DMAChannel # BlockID # MemoryRegion # MemoryRegion;
+
+    dma_progress: DMAChannel # DMAProgress;
+
+    dma_complete: DMAChannel # BlockID;
+
+    dma_conflict_detected;
+
+    security_violation: SecurityDomain # MemoryRegion;
+
+    isolation_check: BlockID # SecurityDomain;
+
+    speculative_prefetch: BlockID;
+    
+    send_validation_request: BlockID # SecurityDomain;     
+    receive_validation_request: BlockID # SecurityDomain;  
+    
+    send_validation_result: BlockID # ValidationResult; 
+    receive_validation_result: BlockID # ValidationResult; 
+    
+    send_ess_request: BlockID;                             
+    receive_ess_request: BlockID;                          
+    
+    send_ess_ready: BlockID;                              
+    receive_ess_ready: BlockID;                            
+    
+    send_efbc_request: BlockID;                            
+    receive_efbc_request: BlockID;                         
+    
+    send_efbc_ready: BlockID;                              
+    receive_efbc_ready: BlockID;                           
+    
+    sync_validation_request: BlockID # SecurityDomain;
+    sync_validation_result: BlockID # ValidationResult;
+    sync_ess_request: BlockID;
+    sync_ess_ready: BlockID;
+    sync_efbc_request: BlockID;
+    sync_efbc_ready: BlockID;
+
+    send_prefetch_request: BlockID # SecurityDomain;
+    receive_prefetch_request: BlockID # SecurityDomain;
+    send_prefetch_result: BlockID # ValidationResult;
+    receive_prefetch_result: BlockID # ValidationResult;
+    sync_prefetch_request: BlockID # SecurityDomain;
+    sync_prefetch_result: BlockID # ValidationResult;
+    
+    internal_ess_load: BlockID; 
+    
+    access_counter_update: BlockID # AccessCount;
+
+% -------------------------------------------------------------------------------
+% Processes
+% -------------------------------------------------------------------------------
+proc
+    % ===========================================================================
+    % Main System Process
+    % ===========================================================================
+    xTEESystem = 
+        EnclaveExecutor(block0, [], [], secure, sequential, 0, 0, 0, 0)
+        || ESSManager([], not_validated, not_validated, not_validated, not_validated, [], [])
+        || DMAController(dma_idle, invalid_block, progress0, dma_idle, invalid_block, progress0)
+        || ValidationEngine(invalid_block, secure, invalid_block);
+
+    % ===========================================================================
+    % Enclave Executor Process
+    % ===========================================================================
+    EnclaveExecutor(current: BlockID, efbc_list: BlockList, ess_list: BlockList, 
+                    domain: SecurityDomain, pattern: AccessPattern,
+                    cnt0: AccessCount, cnt1: AccessCount, 
+                    cnt2: AccessCount, cnt3: AccessCount) =
+
+        (contains(current, efbc_list) && domain == secure) ->
+            execute_instruction(current, domain) .
+            (
+            (current == block0 && cnt0 < 3) -> 
+                access_counter_update(block0, cnt0 + 1) .
+                EnclaveExecutor(next_block(current, pattern), efbc_list, ess_list, domain, 
+                                pattern, cnt0 + 1, cnt1, cnt2, cnt3)
+            +
+            (current == block1 && cnt1 < 3) ->
+                access_counter_update(block1, cnt1 + 1) .
+                EnclaveExecutor(next_block(current, pattern), efbc_list, ess_list, domain,
+                                pattern, cnt0, cnt1 + 1, cnt2, cnt3)
+            +
+            (current == block2 && cnt2 < 3) ->
+                access_counter_update(block2, cnt2 + 1) .
+                EnclaveExecutor(next_block(current, pattern), efbc_list, ess_list, domain,
+                                pattern, cnt0, cnt1, cnt2 + 1, cnt3)
+            +
+            (current == block3 && cnt3 < 3) ->
+                access_counter_update(block3, cnt3 + 1) .
+                EnclaveExecutor(next_block(current, pattern), efbc_list, ess_list, domain,
+                                pattern, cnt0, cnt1, cnt2, cnt3 + 1)
+            )
+        +
+        (!contains(current, efbc_list) && domain == secure) ->
+            memfault(current) .
+            (
+            contains(current, ess_list) ->
+                    ess_check(current, true) .
+                    send_efbc_request(current) .
+                    receive_efbc_ready(current) .
+                    EnclaveExecutor(current, add_block(current, efbc_list), ess_list, domain,
+                                    pattern, cnt0, cnt1, cnt2, cnt3)
+        +
+            !contains(current, ess_list) ->
+                ess_check(current, false) .
+                send_validation_request(current, domain) .
+                receive_validation_result(current, valid) .
+                send_ess_request(current) .
+                receive_ess_ready(current) .
+                send_efbc_request(current) .
+                receive_efbc_ready(current) .
+                EnclaveExecutor(current, add_block(current, efbc_list), add_block(current, ess_list), domain, 
+                            pattern, cnt0, cnt1, cnt2, cnt3)
+            )
+        +
+        (domain == nonsecure && (contains(current, efbc_list) || contains(current, ess_list))) ->
+            security_violation(nonsecure, efbc) .
+            delta; 
+    % ===========================================================================
+    % ESS Manager Process
+    % ===========================================================================
+    ESSManager(ess_blocks: BlockList, 
+                val0: ValidationResult, val1: ValidationResult,
+                val2: ValidationResult, val3: ValidationResult,
+                pending_validations: BlockList,
+                pending_ess_requests: BlockList) =
+    
+        sum b: BlockID . (
+            (list_size(ess_blocks) < 2) ->
+                receive_ess_request(b) .
+                ess_load(b) .
+                send_ess_ready(b) .
+                ESSManager(add_block(b, ess_blocks), val0, val1, val2, val3, 
+                    pending_validations, pending_ess_requests)
+        )
+        +
+        sum b: BlockID . (
+            (list_size(ess_blocks) == 2 && contains(b, ess_blocks)) ->
+                ess_evict(b) .
+                ESSManager(remove_block(b, ess_blocks), val0, val1, val2, val3, 
+                    pending_validations, pending_ess_requests)
+        )
+        +
+        sum b: BlockID . (
+            (list_size(ess_blocks) < 2 && !contains(b, pending_validations) && 
+                !contains(b, ess_blocks) && !contains(b, pending_ess_requests) && b != block0) ->
+
+            speculative_prefetch(b) .
+            send_prefetch_request(b, secure) .
+            ESSManager(ess_blocks, val0, val1, val2, val3, 
+                    add_block(b, pending_validations), pending_ess_requests)
+        )
+        +
+        sum b: BlockID, result: ValidationResult . (
+            contains(b, pending_validations) ->
+                receive_prefetch_result(b, result) .
+                internal_ess_load(b) .
+                ess_load(b) .
+                (
+                    (b == block0) ->
+                        ESSManager(add_block(b, ess_blocks), result, val1, val2, val3, 
+                                remove_block(b, pending_validations), pending_ess_requests)
+                    +
+                    (b == block1) ->
+                        ESSManager(add_block(b, ess_blocks), val0, result, val2, val3, 
+                                remove_block(b, pending_validations), pending_ess_requests)
+                    +
+                    (b == block2) ->
+                        ESSManager(add_block(b, ess_blocks), val0, val1, result, val3, 
+                                remove_block(b, pending_validations), pending_ess_requests)
+                    +
+                    (b == block3) ->
+                        ESSManager(add_block(b, ess_blocks), val0, val1, val2, result, 
+                                remove_block(b, pending_validations), pending_ess_requests)
+                )
+        );
+
+    % ===========================================================================
+    % DMA Controller Process
+    % ===========================================================================
+    DMAController(ch1_state: DMAState, ch1_block: BlockID, ch1_progress: DMAProgress,
+                    ch2_state: DMAState, ch2_block: BlockID, ch2_progress: DMAProgress) =
+    
+        sum b: BlockID . (
+            (ch1_state == dma_idle) ->
+                receive_efbc_request(b) .
+                dma_request(channel1, b, ess, efbc) .
+                DMAController(dma_transferring, b, progress0,
+                            ch2_state, ch2_block, ch2_progress)
+        )
+        +
+        (ch1_state == dma_transferring && ch1_progress == progress0) ->
+            dma_progress(channel1, progress1) .
+            DMAController(ch1_state, ch1_block, progress1,
+                    ch2_state, ch2_block, ch2_progress)
+        +
+        (ch1_state == dma_transferring && ch1_progress == progress1) ->
+            dma_progress(channel1, progress2) .
+            DMAController(ch1_state, ch1_block, progress2,
+                    ch2_state, ch2_block, ch2_progress)
+        +
+        (ch1_state == dma_transferring && ch1_progress == progress2) ->
+            dma_complete(channel1, ch1_block) .
+            efbc_load(ch1_block) .
+            send_efbc_ready(ch1_block) .
+            DMAController(dma_idle, invalid_block, progress0,
+                        ch2_state, ch2_block, ch2_progress)
+        +
+        delta; 
+    % ===========================================================================
+    % Validation Engine Process
+    % ===========================================================================
+    ValidationEngine(validating: BlockID, domain: SecurityDomain, prefetch_validating: BlockID) =
+
+        sum b: BlockID, d: SecurityDomain . (
+            (validating == invalid_block) ->
+                receive_validation_request(b, d) .
+                validate_start(b, d) .
+                (
+                (d == secure) ->
+                    isolation_check(b, d) .
+                    ValidationEngine(b, d, prefetch_validating)
+                +
+                (d == nonsecure) ->
+                    security_violation(nonsecure, validator) .
+                    delta
+                )
+        )
+        +
+        (validating != invalid_block && domain == secure) ->
+            validate_complete(validating, valid) .
+            send_validation_result(validating, valid) .
+            ValidationEngine(invalid_block, domain, prefetch_validating)
+        +
+        sum b: BlockID, d: SecurityDomain . (
+            (prefetch_validating == invalid_block) ->
+                receive_prefetch_request(b, d) .
+                validate_start(b, d) .
+                (
+                (d == secure) ->
+                    isolation_check(b, d) .
+                    ValidationEngine(validating, domain, b)
+                +
+                (d == nonsecure) ->
+                    security_violation(nonsecure, validator) .
+                    delta
+                )
+        )
+        +
+        (prefetch_validating != invalid_block) ->
+            validate_complete(prefetch_validating, valid) .
+            send_prefetch_result(prefetch_validating, valid) .
+            ValidationEngine(validating, domain, invalid_block);
+
+% -------------------------------------------------------------------------------
+% Initialization
+% -------------------------------------------------------------------------------
+init
+    allow({
+        execute_instruction, memfault,
+        ess_check, ess_load, ess_evict,
+        efbc_load,
+        validate_start, validate_complete,
+        dma_request, dma_progress, dma_complete,
+        security_violation, isolation_check,
+        speculative_prefetch, access_counter_update,
+        internal_ess_load,
+        sync_validation_request, sync_validation_result,
+        sync_prefetch_request, sync_prefetch_result,
+        sync_ess_request, sync_ess_ready,
+        sync_efbc_request, sync_efbc_ready
+    },
+    comm({
+        send_validation_request | receive_validation_request -> sync_validation_request,
+        send_validation_result | receive_validation_result -> sync_validation_result,
+        
+        send_prefetch_request | receive_prefetch_request -> sync_prefetch_request,
+        send_prefetch_result | receive_prefetch_result -> sync_prefetch_result,
+        
+        send_ess_request | receive_ess_request -> sync_ess_request,
+        send_ess_ready | receive_ess_ready -> sync_ess_ready,
+        
+        send_efbc_request | receive_efbc_request -> sync_efbc_request,
+        send_efbc_ready | receive_efbc_ready -> sync_efbc_ready
+    },
+        xTEESystem
+    )
+);
