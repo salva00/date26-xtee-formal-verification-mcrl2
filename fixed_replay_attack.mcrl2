@@ -3,6 +3,8 @@
 % ===============================================================================
 % 
 % COUNTERMEASURES: Replay detection system with critical operations blocking
+% For the sake of semplicity, the Security Monitor is embedded 
+%            in the EnclaveExecutor, ValidationEngine, CompromisedDMAController processes
 
 sort
     BlockID = struct block0 | block1 | block2 | block3 | invalid_block;
@@ -135,22 +137,7 @@ proc
         EnclaveExecutor(block0, [], [], secure, sequential, 0, 0, 0, 0, security_normal)
         || ESSManager([], not_validated, not_validated, not_validated, not_validated)
         || CompromisedDMAController(dma_idle, invalid_block, progress0, dma_idle, invalid_block, progress0, security_normal)
-        || ValidationEngine(invalid_block, secure, security_normal)
-        || PrivilegedAttacker(attack_idle, [], [])
-        || SecurityMonitor(security_normal);
-
-    SecurityMonitor(sec_state: SecurityState) =
-        receive_security_alert .
-        replay_attack_detected .
-        security_monitor_activate .
-        security_lockdown_engaged .
-        SecurityMonitor(security_lockdown)
-        +
-        (sec_state == security_lockdown) ->
-            dma_operations_blocked .
-            replay_operations_blocked .
-            attack_prevented .
-            SecurityMonitor(sec_state);
+        || ValidationEngine(invalid_block, secure, security_normal);
 
     PrivilegedAttacker(state: AttackState, monitored_blocks: BlockList, 
                       obsolete_blocks: BlockList) =

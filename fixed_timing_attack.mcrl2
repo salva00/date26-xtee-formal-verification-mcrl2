@@ -6,6 +6,8 @@
 % ATTACKER: Compromised Host OS
 % VULNERABILITY: TEE isolation is compromised through timing analysis
 % COUNTERMEASURES: Compromise detection system with critical operations blocking
+% For the sake of semplicity, the Security Monitor is embedded 
+%            in the CompromisedEnclaveExecutor and TimingSensitiveValidator processes
 
 sort
     BlockID = struct block0 | block1 | block2 | block3 | invalid_block;
@@ -159,8 +161,7 @@ proc
         || ESSManager([], not_validated, not_validated, not_validated, not_validated)
         || DMAController(dma_idle, invalid_block, progress0, dma_idle, invalid_block, progress0)
         || TimingSensitiveValidator(invalid_block, secure, timer_idle, security_normal)
-        || CompromisedHostOS(phase_idle, [], timer_idle, 0)
-        || SecurityMonitor(security_normal);
+        || CompromisedHostOS(phase_idle, [], timer_idle, 0);
 
     CompromisedEnclaveExecutor(current: BlockID, efbc_list: BlockList, ess_list: BlockList, 
                               domain: SecurityDomain, pattern: AccessPattern,
@@ -205,17 +206,6 @@ proc
             CompromisedEnclaveExecutor(current, add_block(current, efbc_list), ess_list, domain,
                                      pattern, cnt0, cnt1, cnt2, cnt3, sec_state);
 
-    SecurityMonitor(sec_state: SecurityState) =
-        receive_security_alert .
-        security_monitor_activate .
-        security_lockdown_engaged .
-        SecurityMonitor(security_lockdown)
-        +
-        (sec_state == security_lockdown) ->
-            timing_operations_blocked .
-            validation_operations_secured .
-            attack_prevented .
-            SecurityMonitor(sec_state);
 
     CompromisedHostOS(phase: AttackPhase, observed_blocks: BlockList, 
                      timer_state: TimerState, measurements: TimingMeasurement) =
@@ -264,6 +254,7 @@ proc
         (phase == phase_blocked) ->
             attack_prevented .
             CompromisedHostOS(phase_blocked, observed_blocks, timer_state, measurements);
+
     TimingSensitiveValidator(validating: BlockID, domain: SecurityDomain, 
                             timer_state: TimerState, sec_state: SecurityState) =
         
